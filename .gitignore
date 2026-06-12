@@ -120,3 +120,28 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 log/
 
 **logs
+
+# ---- handoff: exclude large artifacts & research scratch ----
+verl_checkpoints/
+**/verl_checkpoints/
+*.safetensors
+*.npz
+*.png
+*_results.json
+aod_tool_direction_broad_results.json
+
+# research / analysis scratch (not needed to run baseline or TrustSearch)
+analyze_*.py
+aod_tool_direction*.py
+behav_cf_*.py
+behav_cf*.sbatch
+ctu_*.py
+ctu_*.sbatch
+maxact_*.py
+maxact_*.sbatch
+p2_*.py
+p2_*.sbatch
+probe_*.py
+probe_*.sbatch
+eco_calibrate.py
+run_eco_calib.sbatch

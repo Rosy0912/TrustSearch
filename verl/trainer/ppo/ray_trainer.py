@@ -544,6 +544,11 @@ class RayPPOTrainer(object):
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
 
+        extra_metrics = getattr(self.val_reward_fn, 'last_metrics', None)
+        if isinstance(extra_metrics, dict):
+            for key, value in extra_metrics.items():
+                metric_dict[f'val/{key}'] = value
+
         return metric_dict
 
 

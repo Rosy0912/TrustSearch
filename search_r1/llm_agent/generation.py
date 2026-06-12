@@ -455,7 +455,22 @@ If I want to give the final answer, I should put the answer between <answer> and
             "return_scores": True
         }
         
-        return requests.post(self.config.search_url, json=payload).json()
+        # Robust call: long timeout (CPU FlatIP batch search can take minutes) +
+        # retry with backoff so a transient retriever restart does NOT crash training.
+        import time as _time
+        last_err = None
+        for attempt in range(20):
+            try:
+                resp = requests.post(self.config.search_url, json=payload, timeout=600)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:  # ConnectionError, Timeout, HTTPError, JSON errors
+                last_err = e
+                wait = min(30, 5 * (attempt + 1))
+                print(f"[retriever] request failed (attempt {attempt+1}/20): {e}. "
+                      f"retrying in {wait}s...", flush=True)
+                _time.sleep(wait)
+        raise RuntimeError(f"Retriever unreachable after 20 retries: {last_err}")
 
     def _passages2string(self, retrieval_result):
         format_reference = ''
