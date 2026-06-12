@@ -155,6 +155,11 @@ sbatch eval_base.sbatch             # eval the untrained base model
 Validation runs every `test_freq` steps and reports all three dimensions
 (grep the training log for `val/` or the `[TRUST-VAL]` / `[BASE-VAL]` lines):
 
+> NOTE: the **trust** dimension is computed by the same online counterfactual as in
+> training (validation/eval mode also queries `cf_judge`), so `cf_judge` must be
+> reachable during validation and offline eval. If it is unreachable, trust silently
+> falls back to a temporal proxy (`~0.7`), so make sure the service is up.
+
 | Dimension | Metric | Meaning |
 |---|---|---|
 | Performance | `val/perf/em` (= `val/test_score/nq`) | Exact-Match accuracy |

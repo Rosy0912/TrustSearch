@@ -180,8 +180,8 @@ class EcoRewardManager():
                    'src': src, 'answer': answer, 'n_search': n_search, 'correct': correct}
             rows.append(row)
 
-            # only correct & searched rollouts need a counterfactual (train mode)
-            if (self.reward_mode == 'eco' and self.use_cf and not self.cost_only
+            # correct & searched rollouts need a counterfactual (train 'eco' AND eval modes)
+            if (self.reward_mode in ('eco', 'eval') and self.use_cf and not self.cost_only
                     and correct and n_search > 0):
                 gold = gt['target']
                 gold = list(gold) if isinstance(gold, (list, tuple, np.ndarray)) else [str(gold)]
