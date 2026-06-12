@@ -1,275 +1,205 @@
-# Search-R1: Train your LLMs to reason and call a search engine with reinforcement learning
+# Search-R1 + TrustSearch
 
-<div align="center">
-  <img src="https://raw.githubusercontent.com/PeterGriffinJin/Search-R1/main/public/logo.png" alt="logo" width="300"/>
-</div>
+This repository contains **Search-R1** (an RL framework for training reasoning-and-searching
+interleaved LLMs, built on [veRL](https://github.com/volcengine/verl)) together with
+**TrustSearch**, our extension that rewards *trustworthy and cost-efficient* tool use.
 
-<p align="center">
-  <a href="https://arxiv.org/abs/2503.09516">
-    <img src="https://img.shields.io/badge/Paper1-blue?style=for-the-badge" alt="Button1"/>
-  </a>
-  <a href="https://arxiv.org/abs/2505.15117">
-    <img src="https://img.shields.io/badge/Paper2-green?style=for-the-badge" alt="Button2"/>
-  </a>
-  <a href="https://huggingface.co/collections/PeterJinGo/search-r1-67d1a021202731cb065740f5">
-    <img src="https://img.shields.io/badge/Resources-orange?style=for-the-badge" alt="Button3"/>
-  </a>
-  <a href="https://x.com/BowenJin13/status/1895544294473109889">
-    <img src="https://img.shields.io/badge/Tweet-red?style=for-the-badge" alt="Button4"/>
-  </a>
-  <a href="https://wandb.ai/peterjin/Search-R1-v0.2">
-    <img src="https://img.shields.io/badge/Logs-purple?style=for-the-badge" alt="Button5"/>
-  </a>
-</p>
+- Original Search-R1 usage and theory: see [`README.md`](README.md).
+- This file (`README_TRUSTSEARCH.md`) is the **hand-off guide** for reproducing the
+  baseline vs. TrustSearch comparison on your own cluster.
 
+---
 
-<!-- <strong>Search-R1</strong> is a reinforcement learning framework for <em>training reasoning and searching (tool-call) interleaved LLMs</em>.  -->
-<!-- We built upon [veRL](https://github.com/volcengine/verl). -->
-**Search-R1** is a reinforcement learning framework designed for training **reasoning-and-searching interleaved LLMs**—language models that learn to reason and make tool calls (e.g., to search engines) in a coordinated manner.
+## 1. What is TrustSearch?
 
-<!-- It can be seen as an extension of <strong>DeepSeek-R1(-Zero)</strong> with interleaved search engine calling and an opensource RL training-based solution for <strong>OpenAI DeepResearch</strong>. -->
-Built upon [veRL](https://github.com/volcengine/verl), Search-R1 extends the ideas of **DeepSeek-R1(-Zero)** by incorporating interleaved search engine access and provides a fully open-source RL training pipeline. It serves as an alternative and open solution to **OpenAI DeepResearch**, enabling research and development in tool-augmented LLM reasoning.
+Search-R1 trains the model with a plain Exact-Match (EM) reward: `1` if the final
+answer is correct, else `0`. It cannot tell *whether the model actually used the
+retrieved documents* or just answered from parametric memory, and it does not penalize
+unnecessary searches.
 
-<!-- Through RL (rule-based outcome reward), the 3B **base** LLM (both Qwen2.5-3b-base and Llama3.2-3b-base) develops reasoning and search engine calling abilities all on its own. -->
+TrustSearch optimizes three things at once — **performance, trust, and cost**:
 
-We support different RL methods (e.g., PPO, GRPO, reinforce), different LLMs (e.g., llama3, Qwen2.5, etc) and different search engines (e.g., local sparse/dense retrievers and online search engines).
+```
+answer = None              -> 0
+correct & no_search        -> 1 + BONUS            (knew the answer, no need to search)
+wrong   & no_search        -> -PENALTY             (should have searched)
+wrong   & searched         -> 0
+correct & searched         -> D_trust * (1 - alpha * norm_cost)
+```
 
-Paper: [link1](https://arxiv.org/pdf/2503.09516), [link2](https://arxiv.org/abs/2505.15117); Model and data: [link](https://huggingface.co/collections/PeterJinGo/search-r1-67d1a021202731cb065740f5); Twitter thread: [link](https://x.com/BowenJin13/status/1895544294473109889); Full experiment log: [prelim](https://wandb.ai/peterjin/Search-R1-open); [v0.1](https://wandb.ai/peterjin/Search-R1-nq_hotpotqa_train); [v0.2](https://wandb.ai/peterjin/Search-R1-v0.2); [v0.3](https://wandb.ai/peterjin/Search-R1-v0.3). Details about these logs and methods can be find [here](https://github.com/PeterGriffinJin/Search-R1/blob/main/docs/experiment_log.md).
+`D_trust` is an **online counterfactual** signal: for every correct & searched rollout,
+we corrupt the retrieved docs (replace the gold answer with a fake entity) and let the
+model answer again.
 
+| Counterfactual outcome | meaning | D_trust |
+|---|---|---|
+| answer **changes** under fake docs | really used the tool (`TRUE_TOOL`) | `1.0` |
+| still correct on fake docs | ignored the tool / parametric (`PARAM_HALL`) | `0.3` (floor) |
+| ambiguous | – | `0.6` |
 
-![single-turn](public/main.png)
+`norm_cost = max(0, n_search - 1) / (MAX_SEARCH - 1)` so the **first search is free** and
+extra searches are penalized by `alpha` (default `0.5`, `MAX_SEARCH=2`).
 
-## News
+Key source files:
 
-- [2025.10] Search-R1 is featured by Thinking Machines Lab's first product [Tinker](https://github.com/thinking-machines-lab/tinker-cookbook)! Details: [Document](https://github.com/thinking-machines-lab/tinker-cookbook/tree/main/tinker_cookbook/recipes/tool_use/search).
-- [2025.7] Search-R1 is supported by [SkyRL](https://github.com/NovaSky-AI/SkyRL)! Detailed instructions: [code](https://github.com/NovaSky-AI/SkyRL/tree/main/skyrl-train/examples/search), [Document](https://novasky-ai.notion.site/skyrl-searchr1).
-- [2025.6] Search-R1 is now integrated into the latest version of veRL and can take advantage of its most up-to-date features! Detailed instructions: [veRL](https://verl.readthedocs.io/en/latest/sglang_multiturn/search_tool_example.html), [English Document](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/verl/multi-turn/tool_examples/verl-multiturn-searchR1-like.md), [Chinese Document](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/verl/multi-turn/tool_examples/verl-multiturn-searchR1-like_ZH.md).
-- [2025.5] The second [paper](https://arxiv.org/abs/2505.15117) conducting detailed empirical studies is published with logs: [v0.3](https://wandb.ai/peterjin/Search-R1-v0.3). 
-- [2025.4] We support [multinode](https://github.com/PeterGriffinJin/Search-R1/blob/main/docs/multinode.md) training for 30B+ LLMs!
-- [2025.4] We support [different search engines](https://github.com/PeterGriffinJin/Search-R1/blob/main/docs/retriever.md) including sparse local retriever, dense local retriever with ANN indexing and online search engines!
-- [2025.3] The first Search-R1 [paper](https://arxiv.org/pdf/2503.09516) is published with the logs: [v0.1](https://wandb.ai/peterjin/Search-R1-nq_hotpotqa_train); [v0.2](https://wandb.ai/peterjin/Search-R1-v0.2).
-- [2025.2] We opensource Search-R1 codebase with [preliminary results](https://wandb.ai/peterjin/Search-R1-open).
+| File | Role |
+|---|---|
+| `verl/trainer/main_ppo_eco.py` | TrustSearch reward manager (online counterfactual) + 3-dim validation |
+| `cf_judge_server.py` | HTTP service that performs the counterfactual judging |
+| `verl/trainer/main_ppo.py` | Search-R1 baseline (plain EM) + 3-dim validation logging |
+| `search_r1/llm_agent/generation.py` | rollout / search loop (with retriever retry) |
+| `search_r1/search/retrieval_server.py` | local dense retriever (FastAPI + e5 + FAISS) |
 
-## Links
+---
 
-- [Installation](#installation)
-- [Quick start](#quick-start)
-- [Preliminary results](#preliminary-results)
-- [Inference](#inference)
-- [Use your own dataset](#use-your-own-dataset)
-- [Use your own search engine](#use-your-own-search-engine)
-- [Features](#features)
-- [Ackowledge](#acknowledge)
-- [Citations](#citations)
+## 2. Environment
 
-## Installation
-
-### Search-r1 environment
 ```bash
-conda create -n searchr1 python=3.9
+conda create -n searchr1 python=3.9 -y
 conda activate searchr1
-# install torch [or you can skip this step and let vllm to install the correct version for you]
-pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
-# install vllm
-pip3 install vllm==0.6.3 # or you can install 0.5.4, 0.4.2 and 0.3.1
 
-# verl
-pip install -e .
+# veRL + Search-R1 deps (see README_SearchR1.md for the full list)
+pip install -r requirements.txt
+pip install -e .                      # installs the local `verl` package
 
-# flash attention 2
-pip3 install flash-attn --no-build-isolation
-pip install wandb
+# vLLM 0.5.4 backend is expected; flash-attn optional (see install_flash_attn.sbatch)
 ```
 
-### Retriever environment (optional)
-If you would like to call a local retriever as the search engine, you can install the environment as follows. (We recommend using a seperate environment.)
+The counterfactual judge (`cf_judge_server.py`) additionally needs:
+`fastapi`, `uvicorn`, `transformers`, `torch` (already covered by the env above).
+
+---
+
+## 3. Download data & models
+
 ```bash
-conda create -n retriever python=3.10
-conda activate retriever
-
-# we recommend installing torch with conda for faiss-gpu
-conda install pytorch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 pytorch-cuda=12.1 -c pytorch -c nvidia
-pip install transformers datasets pyserini
-
-## install the gpu version faiss to guarantee efficient RL rollout
-conda install -c pytorch -c nvidia faiss-gpu=1.8.0
-
-## API function
-pip install uvicorn fastapi
+bash download_all.sh          # or: sbatch download.sbatch
 ```
 
+This fetches:
 
-## Quick start
+- **Corpus**: `data/retriever_data/wiki-18.jsonl` (~21M passages)
+- **FAISS index**: `data/retriever_data/e5_Flat.index`
+- **QA data**: `data/nq_search/{train,test}.parquet`
 
-Train a reasoning + search LLM on NQ dataset with e5 as the retriever and wikipedia as the corpus.
+You also need two HuggingFace models (set your own local paths):
 
-(1) Download the indexing and corpus.
+- Policy / base model: `Qwen/Qwen2.5-3B-Instruct`
+- Retriever encoder: `intfloat/e5-base-v2`
+
+> NOTE: corpus, index, checkpoints and parquet data are **git-ignored** (too large for
+> GitHub). Every user must download them locally.
+
+---
+
+## 4. Cluster-specific settings (IMPORTANT — edit before running)
+
+All `*.sbatch` files were written for our SLURM cluster and **hardcode** node names,
+partitions and service IPs. You must change them for your machine:
+
+- `#SBATCH --partition=...`, `#SBATCH --nodelist=...`, `#SBATCH --gres=gpu:N`
+- `RETRIEVER_URL="http://<retriever-node-ip>:8000/retrieve"`
+- `CF_JUDGE_URL="http://<cf-judge-node-ip>:8001/judge_batch"`
+- model paths: `actor_rollout_ref.model.path=...` (in `*_common.sh`) and
+  `--retriever_model` (in `start_retriever*.sbatch`)
+
+If you run everything on a single multi-GPU node, just point all URLs at `127.0.0.1`.
+
+---
+
+## 5. Run order
+
+The trainers need the **retriever** (and, for TrustSearch, the **cf_judge**) up first.
+
+### Step 1 — start the retriever(s)
+
 ```bash
-save_path=/the/path/to/save
-python scripts/download.py --save_path $save_path
-cat $save_path/part_* > $save_path/e5_Flat.index
-gzip -d $save_path/wiki-18.jsonl.gz
+sbatch start_retriever.sbatch       # serves http://<node>:8000/retrieve
 ```
 
-(2) Process the NQ dataset.
+Wait until it logs that the index is loaded (loading 21M passages takes several minutes).
+You can give the baseline and TrustSearch their own retriever to avoid contention
+(`start_retriever_b.sbatch`, `start_retriever_c.sbatch`).
+
+### Step 2 — start the counterfactual judge (TrustSearch only)
+
 ```bash
-python scripts/data_process/nq_search.py
+sbatch start_cf_judge.sbatch        # serves http://<node>:8001/judge_batch
 ```
 
-(3) Launch a local retrieval server.
+### Step 3 — launch training
+
 ```bash
-conda activate retriever
-bash retrieval_launch.sh
+# Search-R1 baseline (plain EM reward)
+sbatch train_baseline.sbatch
+
+# TrustSearch (online counterfactual trust + cost)
+sbatch train_eco_full.sbatch
 ```
 
-(4) Run RL training (PPO) with Llama-3.2-3b-base.
+Both use identical hyper-parameters (GRPO, Qwen2.5-3B-Instruct, n_agent=5,
+max_turns=2); the **only difference is the reward**, so the comparison is clean.
+
+### Step 4 — offline 3-dimension evaluation of a checkpoint
+
 ```bash
-conda activate searchr1
-bash train_ppo.sh
+# edit MODEL_PATH inside, then:
+sbatch eval_ckpt50.sbatch           # eval a trained checkpoint
+sbatch eval_base.sbatch             # eval the untrained base model
 ```
 
-## Preliminary results
+---
 
-(1) The base model (llama3.2-3b-base) learns to call the search engine and obtain improved performance.
+## 6. Reading the metrics
 
-![llama-3b](public/llama32-3b.png)
+Validation runs every `test_freq` steps and reports all three dimensions
+(grep the training log for `val/` or the `[TRUST-VAL]` / `[BASE-VAL]` lines):
 
+| Dimension | Metric | Meaning |
+|---|---|---|
+| Performance | `val/perf/em` (= `val/test_score/nq`) | Exact-Match accuracy |
+| Trust | `val/trust/trust_at_correct` | avg counterfactual trust of correct answers |
+| Trust | `val/trust/hall_rate` | fraction of correct answers that look parametric (`PARAM_HALL`) |
+| Cost | `val/cost/search_per_query` | avg searches per question |
+| Cost | `val/cost/nosearch_rate` | fraction answered with no search |
+| Cost | `val/cost/oversearch_rate` | fraction with >1 search |
 
-(2) The base model (Qwen2.5-7b-base) can learn to conduct multi-turn search engine calling and reasoning with RL.
-
-![multi-turn](public/multi-turn.png)
-
-## Inference
-#### You can play with the trained Search-R1 model with your own question.
-(1) Launch a local retrieval server.
-```bash
-conda activate retriever
-bash retrieval_launch.sh
-```
-
-(2) Run inference.
-```bash
-conda activate searchr1
-python infer.py
-```
-You can modify the ```question``` on line 7 to something you're interested in.
-
-## Use your own dataset
-
-### QA data
-For each question-answer sample, it should be a dictionary containing the desired content as below:
+During training the reward manager also prints per-batch stats:
 
 ```
-data = {
-        "data_source": data_source,
-        "prompt": [{
-            "role": "user",
-            "content": question,
-        }],
-        "ability": "fact-reasoning",
-        "reward_model": {
-            "style": "rule",
-            "ground_truth": solution
-        },
-        "extra_info": {
-            'split': split,
-            'index': idx,
-        }
-    }
+[TRUST] call~N | PERF em=... | TRUST trust@correct=... cf[TRUE=.. HALL=.. AMB=..] | COST search/q=.. nosearch=.. alpha=.. | reward=..
 ```
 
-You can refer to ```scripts/data_process/nq_search.py``` for a concrete data processing example.
+---
 
-### Corpora
+## 7. Reward knobs (env vars for TrustSearch)
 
-It is recommended to make your corpus a jsonl file, where each line (a dictionary with "id" key and "contents" key) corresponds to one passage. You can refer to ```example/corpus.jsonl``` for an example.
+Set in `train_eco_full.sbatch`:
 
-The "id" key corresponds to the passage id, while the "contents" key corresponds to the passage content ('"' + title + '"\n' + text).
-For example:
+| Var | Default | Meaning |
+|---|---|---|
+| `ECO_USE_CF` | `1` | use online counterfactual D_trust (`0` = temporal proxy) |
+| `ECO_FLOOR` | `0.3` | D_trust for `PARAM_HALL` |
+| `ECO_ALPHA` | `0.5` | search-cost strength |
+| `CF_JUDGE_URL` | – | counterfactual judge endpoint |
+| `ECO_COST_ONLY` / `ECO_TRUST_ONLY` / `ECO_NO_SELF` | `0` | ablations |
+
+---
+
+## 8. Layout
+
 ```
-{"id": "0", "contents": "Evan Morris Evan L. Morris (January 26, 1977 \u2013 July 9, 2015) was a lobbyist for Genentech and its parent corporation Roche in Washington."}
-...
-{"id": "100", "contents": "Three years later, when the United States Exploring Expedition to little-known portions of the globe was organised under Charles Wilkes, Hale was recommended, while yet an undergraduate."}
-...
-```
-
-**Index your corpora (optional).**
-If you would like to use a local retriever as the search engine, you can index your own corpus by:
-```
-bash search_r1/search/build_index.sh
-```
-You can change ```retriever_name``` and ```retriever_model``` to your interested off-the-shelf retriever.
-
-## Use your own search engine
-
-Our codebase supports local sparse retriever (e.g., BM25), local dense retriever (both flat indexing with GPUs and ANN indexing with CPUs) and online search engine (e.g., Google, Bing, etc). More details can be found [here](https://github.com/PeterGriffinJin/Search-R1/tree/main/docs/retriever.md).
-
-The main philosophy is to launch a local or remote search engine server separately from the main RL training pipeline. 
-
-The LLM can call the search engine by calling the search API (e.g., "http://127.0.0.1:8000/retrieve").
-
-You can refer to ```search_r1/search/retriever_server.py``` for an example of launching a local retriever server.
-
-## Features
-- Support local sparse retrievers (e.g., BM25). ✔️
-- Support local dense retrievers (both flat indexing and ANN indexing) ✔️
-- Support google search / bing search / brave search API and others. ✔️
-- Support off-the-shelf neural rerankers. ✔️
-- Support different RL methods (e.g., PPO, GRPO, reinforce). ✔️
-- Support different LLMs (e.g., llama3, Qwen2.5, etc). ✔️
-
-## Acknowledge
-
-The concept of Search-R1 is inspired by [Deepseek-R1](https://github.com/deepseek-ai/DeepSeek-R1) and [TinyZero](https://github.com/Jiayi-Pan/TinyZero/tree/main).
-Its implementation is built upon [veRL](https://github.com/volcengine/verl) and [RAGEN](https://github.com/ZihanWang314/RAGEN/tree/main). 
-We sincerely appreciate the efforts of these teams for their contributions to open-source research and development.
-
-## Awesome work powered or inspired by Search-R1
-
-- [DeepResearcher](https://github.com/GAIR-NLP/DeepResearcher): Scaling Deep Research via Reinforcement Learning in Real-world Environments. [![[code]](https://img.shields.io/github/stars/GAIR-NLP/DeepResearcher)](https://github.com/GAIR-NLP/DeepResearcher)
-- [Multimodal-Search-R1](https://github.com/EvolvingLMMs-Lab/multimodal-search-r1): Incentivizing LMMs to Search. [![[code]](https://img.shields.io/github/stars/EvolvingLMMs-Lab/multimodal-search-r1)](https://github.com/EvolvingLMMs-Lab/multimodal-search-r1)
-- [OTC](https://arxiv.org/pdf/2504.14870): Optimal Tool Calls via Reinforcement Learning.
-- [ZeroSearch](https://github.com/Alibaba-NLP/ZeroSearch): Incentivize the Search Capability of LLMs without Searching. [![[code]](https://img.shields.io/github/stars/Alibaba-NLP/ZeroSearch)](https://github.com/Alibaba-NLP/ZeroSearch)
-- [IKEA](https://github.com/hzy312/knowledge-r1): Reinforced Internal-External Knowledge Synergistic Reasoning for Efficient Adaptive Search Agent. [![[code]](https://img.shields.io/github/stars/hzy312/knowledge-r1)](https://github.com/hzy312/knowledge-r1)
-- [Scent of Knowledge](https://arxiv.org/abs/2505.09316): Optimizing Search-Enhanced Reasoning with Information Foraging.
-- [AutoRefine](https://www.arxiv.org/pdf/2505.11277): Search and Refine During Think. [![[code]](https://img.shields.io/github/stars/syr-cn/AutoRefine)](https://github.com/syr-cn/AutoRefine)
-- [O^2-Searcher](https://arxiv.org/pdf/2505.16582): A Searching-based Agent Model for Open-Domain Open-Ended Question Answering. [![[code]](https://img.shields.io/github/stars/Acade-Mate/O2-Searcher)](https://github.com/Acade-Mate/O2-Searcher)
-- [MaskSearch](https://arxiv.org/pdf/2505.20285): A Universal Pre-Training Framework to Enhance Agentic Search Capability. [![[code]](https://img.shields.io/github/stars/Alibaba-NLP/MaskSearch)](https://github.com/Alibaba-NLP/MaskSearch)
-- [VRAG-RL](https://arxiv.org/abs/2505.22019): Vision-Perception-Based RAG for Visually Rich Information Understanding. [![[code]](https://img.shields.io/github/stars/Alibaba-NLP/VRAG)](https://github.com/Alibaba-NLP/VRAG)
-- [R1-Code-Interpreter](https://arxiv.org/abs/2505.21668): Training LLMs to Reason with Code via SFT and RL. [![[code]](https://img.shields.io/github/stars/yongchao98/R1-Code-Interpreter)](https://github.com/yongchao98/R1-Code-Interpreter)
-- [R-Search](https://arxiv.org/abs/2506.04185): Empowering LLM Reasoning with Search via Multi-Reward Reinforcement Learning. [![[code]](https://img.shields.io/github/stars/QingFei1/R-Search)](https://github.com/QingFei1/R-Search)
-- [StepSearch](https://arxiv.org/pdf/2505.15107): Igniting LLMs Search Ability via Step-Wise Proximal Policy Optimization. [![[code]](https://img.shields.io/github/stars/Zillwang/StepSearch)](https://github.com/Zillwang/StepSearch)
-- [SimpleTIR](https://simpletir.notion.site/report): Stable End-to-End Reinforcement Learning for Multi-Turn Tool-Integrated Reasoning. [![[code]](https://img.shields.io/github/stars/ltzheng/SimpleTIR)](https://github.com/ltzheng/SimpleTIR)
-- [Router-R1](https://arxiv.org/pdf/2506.09033): Teaching LLMs Multi-Round Routing and Aggregation via Reinforcement Learning. [![[code]](https://img.shields.io/github/stars/ulab-uiuc/Router-R1)](https://github.com/ulab-uiuc/Router-R1)
-- [SkyRL](https://skyrl.readthedocs.io/en/latest/): A Modular Full-stack RL Library for LLMs. [![[code]](https://img.shields.io/github/stars/NovaSky-AI/SkyRL)](https://github.com/NovaSky-AI/SkyRL)
-- [ASearcher](https://arxiv.org/abs/2508.07976): Large-Scale RL for Search Agents. [![[code]](https://img.shields.io/github/stars/inclusionAI/ASearcher)](https://github.com/inclusionAI/ASearcher)
-- [ParallelSearch](https://www.arxiv.org/abs/2508.09303): Decompose Query and Search Sub-queries in Parallel with RL. [![[code]](https://img.shields.io/github/stars/Tree-Shu-Zhao/ParallelSearch)](https://github.com/Tree-Shu-Zhao/ParallelSearch)
-- [AutoTIR](https://arxiv.org/pdf/2507.21836): Autonomous Tools Integrated Reasoning via Reinforcement Learning. [![[code]](https://img.shields.io/github/stars/weiyifan1023/AutoTIR)](https://github.com/weiyifan1023/AutoTIR)
-- [verl-tool](https://arxiv.org/pdf/2509.01055): A version of verl to support diverse tool use. [![[code]](https://img.shields.io/github/stars/TIGER-AI-Lab/verl-tool)](https://github.com/TIGER-AI-Lab/verl-tool)
-- [Tree-GRPO](https://arxiv.org/abs/2509.21240): Tree Search for LLM Agent Reinforcement Learning. [![[code]](https://img.shields.io/github/stars/AMAP-ML/Tree-GRPO)](https://github.com/AMAP-ML/Tree-GRPO)
-- [EviNote-RAG](https://arxiv.org/abs/2509.00877): Enhancing RAG Models via Answer-Supportive Evidence Notes. [![[code]](https://img.shields.io/github/stars/Da1yuqin/EviNoteRAG)](https://github.com/Da1yuqin/EviNoteRAG)
-- [GlobalRAG](https://arxiv.org/pdf/2510.20548v1): GlobalRAG: Enhancing Global Reasoning in Multi-hop Question Answering via Reinforcement Learning. [![[code]](https://img.shields.io/github/stars/CarnegieBin/GlobalRAG)](https://github.com/CarnegieBin/GlobalRAG)
-
-
-
-
-
-## Citations
-
-```bibtex
-@article{jin2025search,
-  title={Search-r1: Training llms to reason and leverage search engines with reinforcement learning},
-  author={Jin, Bowen and Zeng, Hansi and Yue, Zhenrui and Yoon, Jinsung and Arik, Sercan and Wang, Dong and Zamani, Hamed and Han, Jiawei},
-  journal={arXiv preprint arXiv:2503.09516},
-  year={2025}
-}
+verl/                      # veRL core (modified: trainers, fsdp workers, reward)
+  trainer/main_ppo.py      #   Search-R1 baseline entry (+3-dim val)
+  trainer/main_ppo_eco.py  #   TrustSearch entry (online counterfactual)
+search_r1/                 # retriever server + rollout/search agent
+cf_judge_server.py         # counterfactual judge HTTP service
+train_baseline.sbatch      # baseline launcher          + baseline_train_common.sh
+train_eco_full.sbatch      # TrustSearch launcher        + eco_train_common.sh
+start_retriever*.sbatch    # retriever services
+start_cf_judge.sbatch      # cf judge service
+eval_*.sbatch              # offline 3-dim evaluation    + eval_3dim_common.sh
+data/  verl_checkpoints/   # (git-ignored) download / produced locally
 ```
 
-```bibtex
-@article{jin2025empirical,
-  title={An Empirical Study on Reinforcement Learning for Reasoning-Search Interleaved LLM Agents},
-  author={Jin, Bowen and Yoon, Jinsung and Kargupta, Priyanka and Arik, Sercan O and Han, Jiawei},
-  journal={arXiv preprint arXiv:2505.15117},
-  year={2025}
-}
-```
+Built on Search-R1 (Jin et al.) and veRL. See `LICENSE`.
