@@ -110,6 +110,26 @@ class EcoRewardManager():
         self.trust_only = os.environ.get("ECO_TRUST_ONLY", "0") == "1"
         self.use_cf = os.environ.get("ECO_USE_CF", "1") == "1"
         self.cf_url = os.environ.get("CF_JUDGE_URL", "http://127.0.0.1:8001/judge_batch")
+        # ---- trust-centric reward variants (anti-hallucination) ----
+        # legacy    : reward = d_trust * cost_factor  (trust as a soft multiplier, original)
+        # gate      : PARAM_HALL (memorized) counted as failure -> 0  (Method 1: hard grounding gate)
+        # additive  : reward = w_trust*d_trust + w_perf*correct - w_cost*cost  (Method 2: trust as main term)
+        # cf_primary: counterfactual IS the primary signal, PARAM_HALL penalized < 0  (Method 3)
+        self.trust_variant = os.environ.get("ECO_TRUST_VARIANT", "legacy")
+        # which trust signal feeds the 'balanced' grounding bonus during TRAINING:
+        #   cf      : counterfactual injection (fake entity)         [judge /judge_batch]
+        #   lexical : answer string appears in retrieved docs        [no judge needed]
+        #   nli     : evidence entails the answer (faithfulness)     [judge /judge_faithfulness]
+        #   removal : redact evidence and re-answer (leave-one-out)  [judge /judge_removal]
+        # Validation/eval always uses cf injection for a comparable cross-method metric.
+        self.trust_signal = os.environ.get("ECO_TRUST_SIGNAL", "cf")
+        self.w_trust = float(os.environ.get("ECO_W_TRUST", "1.0"))
+        self.w_perf = float(os.environ.get("ECO_W_PERF", "0.3"))
+        self.w_cost = float(os.environ.get("ECO_W_COST", "0.2"))
+        self.hall_penalty = float(os.environ.get("ECO_HALL_PENALTY", "0.5"))
+        # 'balanced' variant: perf floor + additive grounding bonus + cost (no perf-trust artifact)
+        self.bal_nosearch_bonus = float(os.environ.get("ECO_BAL_NOSEARCH_BONUS", "0.5"))
+        self.bal_ground = float(os.environ.get("ECO_BAL_GROUND", "0.5"))
         self.ema_em = 0.0
         self.ema_trust = 0.0
         self._init = False
@@ -117,27 +137,59 @@ class EcoRewardManager():
         # counterfactual outcome counters (for logging)
         self._cf_session = requests.Session()
         self._cf_session.trust_env = False
-        print(f"[ECO-INIT] mode={reward_mode} floor={self.floor} alpha={self.alpha} "
+        print(f"[ECO-INIT] mode={reward_mode} variant={self.trust_variant} signal={self.trust_signal} "
+              f"floor={self.floor} alpha={self.alpha} bal_ground={self.bal_ground} "
+              f"w_trust={self.w_trust} w_perf={self.w_perf} w_cost={self.w_cost} hall_penalty={self.hall_penalty} "
               f"use_cf={self.use_cf} cf_url={self.cf_url} no_self={self.no_self} "
               f"cost_only={self.cost_only} trust_only={self.trust_only}")
 
     # ---- online counterfactual call ----
-    def _judge_batch(self, items):
-        """items: list of {question, info, gold}. Returns list of {ans_cf, injected, em_cf} or None."""
+    def _judge_batch(self, items, path="/judge_batch"):
+        """POST items to the judge service at `path`. Returns results list or None.
+        path: /judge_batch (cf injection) | /judge_faithfulness (nli) | /judge_removal."""
         if not items:
             return []
+        base = self.cf_url.rsplit('/', 1)[0]
+        url = base + path
         payload = {"items": items}
         import time as _t
         for attempt in range(10):
             try:
-                resp = self._cf_session.post(self.cf_url, json=payload, timeout=600)
+                resp = self._cf_session.post(url, json=payload, timeout=600)
                 resp.raise_for_status()
                 return resp.json()["results"]
             except Exception as e:
-                print(f"[cf_judge] request failed (attempt {attempt+1}/10): {e}", flush=True)
+                print(f"[cf_judge] {path} request failed (attempt {attempt+1}/10): {e}", flush=True)
                 _t.sleep(min(30, 5 * (attempt + 1)))
-        print("[cf_judge] UNAVAILABLE -> fallback to causal proxy", flush=True)
+        print(f"[cf_judge] {path} UNAVAILABLE -> fallback to causal proxy", flush=True)
         return None
+
+    def _train_ground(self, row, cf_res):
+        """Grounding signal in [0,1] for the 'balanced' bonus during training, dispatched
+        by ECO_TRUST_SIGNAL. Returns (ground, cf_class) where cf_class in true/amb/hall."""
+        s = self.trust_signal
+        if s == 'lexical':
+            info = _extract_info_raw(row['seq'])
+            ans = qa_em.normalize_answer(row['answer'] or "")
+            ok = bool(ans) and ans in qa_em.normalize_answer(info)
+            return (1.0 if ok else 0.0), ('true' if ok else 'hall')
+        if s == 'nli':
+            if cf_res is None or 'supported' not in cf_res:
+                return 0.5, 'amb'
+            ok = int(cf_res.get('supported', 0)) == 1
+            return (1.0 if ok else 0.0), ('true' if ok else 'hall')
+        if s == 'removal':
+            if cf_res is None or not cf_res.get('removed', False):
+                return 0.5, 'amb'
+            changed = qa_em.normalize_answer(row['answer']) != qa_em.normalize_answer(cf_res.get('ans_cf', ''))
+            return (1.0 if changed else 0.0), ('true' if changed else 'hall')
+        # default 'cf': counterfactual injection
+        d = self._cf_trust(row['answer'], cf_res, row['seq'])
+        if d >= 0.99:
+            return 1.0, 'true'
+        if abs(d - self.floor) < 1e-6:
+            return 0.0, 'hall'
+        return 0.5, 'amb'
 
     def _cf_trust(self, answer_real, cf_res, solution_str):
         """Map counterfactual outcome to D_trust."""
@@ -180,20 +232,31 @@ class EcoRewardManager():
                    'src': src, 'answer': answer, 'n_search': n_search, 'correct': correct}
             rows.append(row)
 
-            # correct & searched rollouts need a counterfactual (train 'eco' AND eval modes)
+            # Correct & searched rollouts need a judge call (train 'eco' AND eval modes).
+            # Eval always uses cf injection; training uses ECO_TRUST_SIGNAL (lexical needs none).
+            need_judge = not (self.reward_mode == 'eco' and self.trust_signal == 'lexical')
             if (self.reward_mode in ('eco', 'eval') and self.use_cf and not self.cost_only
-                    and correct and n_search > 0):
+                    and correct and n_search > 0 and need_judge):
                 gold = gt['target']
                 gold = list(gold) if isinstance(gold, (list, tuple, np.ndarray)) else [str(gold)]
                 cf_reqs.append((len(rows) - 1,
                                 {"question": _extract_question(seq_str),
                                  "info": _extract_info_raw(seq_str),
-                                 "gold": [str(g) for g in gold]}))
+                                 "gold": [str(g) for g in gold],
+                                 "answer": str(answer) if answer is not None else ""}))
 
-        # ---- Phase 2: batch counterfactual judge ----
+        # ---- Phase 2: batch judge (endpoint depends on mode/signal) ----
         cf_map = {}
         if cf_reqs:
-            results = self._judge_batch([r[1] for r in cf_reqs])
+            if self.reward_mode == 'eval' or self.trust_signal == 'cf':
+                path = '/judge_batch'
+            elif self.trust_signal == 'nli':
+                path = '/judge_faithfulness'
+            elif self.trust_signal == 'removal':
+                path = '/judge_removal'
+            else:
+                path = '/judge_batch'
+            results = self._judge_batch([r[1] for r in cf_reqs], path)
             if results is not None:
                 for (ridx, _), res in zip(cf_reqs, results):
                     cf_map[ridx] = res
@@ -308,13 +371,27 @@ class EcoRewardManager():
         answer = row['answer']
         n_search = row['n_search']
         correct = row['correct']
+        v = self.trust_variant
         if answer is None:
             return 0.0, 0.0, None
+
+        # ---- no-search branch (no tool use -> nothing to hallucinate) ----
         if n_search == 0:
-            return ((1.0 + self.BONUS) if correct else (-self.PENALTY)), float(correct), None
+            if not correct:
+                return -self.PENALTY, 0.0, None
+            if v == 'additive':
+                return self.w_perf + self.w_trust, 1.0, None
+            if v == 'cf_primary':
+                return 1.0, 1.0, None
+            if v == 'balanced':
+                return 1.0 + self.bal_nosearch_bonus, 1.0, None
+            return 1.0 + self.BONUS, 1.0, None   # legacy / gate
+
+        # ---- searched & wrong ----
         if not correct:
             return 0.0, 0.0, None
-        # correct & searched
+
+        # ---- searched & correct: counterfactual D_trust ----
         if self.cost_only:
             d_trust, cls = 1.0, None
         elif self.use_cf:
@@ -323,11 +400,43 @@ class EcoRewardManager():
                    ('hall' if abs(d_trust - self.floor) < 1e-6 else 'amb'))
         else:
             d_trust, cls = _causal_trust(row['seq'], floor=self.floor), None
-        if self.trust_only:
-            cost_factor = 1.0
-        else:
-            norm_cost = min(1.0, max(0.0, (n_search - 1)) / max(1.0, self.MAX_SEARCH - 1))
-            cost_factor = 1.0 - self.alpha * norm_cost
+
+        norm_cost = min(1.0, max(0.0, (n_search - 1)) / max(1.0, self.MAX_SEARCH - 1))
+        cost_factor = 1.0 if self.trust_only else (1.0 - self.alpha * norm_cost)
+
+        if v == 'gate':
+            # Method 1: answer-by-memory (PARAM_HALL) is treated as failure.
+            if cls == 'hall':
+                return 0.0, d_trust, cls
+            return d_trust * cost_factor, d_trust, cls
+
+        if v == 'additive':
+            # Method 2: trust is the dominant additive term, not a multiplier.
+            reward = self.w_trust * d_trust + self.w_perf * 1.0 - self.w_cost * norm_cost
+            return reward, d_trust, cls
+
+        if v == 'cf_primary':
+            # Method 3: the counterfactual outcome IS the primary reward signal.
+            #   TRUE_TOOL (answer changed under fake docs) -> +1.0
+            #   PARAM_HALL (ignored docs, still correct)   -> negative penalty
+            #   AMB                                        -> small positive (floor)
+            if cls == 'true':
+                base = 1.0
+            elif cls == 'hall':
+                base = -self.hall_penalty
+            else:
+                base = self.floor
+            return base - self.w_cost * norm_cost, d_trust, cls
+
+        if v == 'balanced':
+            # perf floor (never zero a correct answer) + additive grounding bonus + cost.
+            # Grounding comes from ECO_TRUST_SIGNAL (cf / lexical / nli / removal):
+            #   ground in {1.0 (grounded), 0.5 (ambiguous), 0.0 (not grounded / memorized)}.
+            # PARAM_HALL / not-grounded simply gets no bonus, but is NOT penalized.
+            g, gcls = self._train_ground(row, cf_res)
+            return 1.0 + self.bal_ground * g - self.w_cost * norm_cost, g, gcls
+
+        # legacy (default): trust as soft multiplier
         return d_trust * cost_factor, d_trust, cls
 
 

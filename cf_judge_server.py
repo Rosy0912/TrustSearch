@@ -83,10 +83,22 @@ def make_misleading(info: str, golds: List[str], rng: random.Random):
     return cf, injected
 
 
+def make_removed(info: str, golds: List[str]):
+    """Redact gold answers from info (leave-one-out style). Returns (cf_info, removed)."""
+    cf = info
+    removed = False
+    for g in golds:
+        if g and g.lower() in cf.lower():
+            cf = re.compile(re.escape(g), re.IGNORECASE).sub("[redacted]", cf)
+            removed = True
+    return cf, removed
+
+
 class JudgeItem(BaseModel):
     question: str
     info: str
-    gold: List[str]
+    gold: List[str] = []
+    answer: Optional[str] = None
 
 
 class JudgeRequest(BaseModel):
@@ -113,6 +125,18 @@ def _batch_generate(prompts: List[str], max_new: int = 64) -> List[str]:
     return outs
 
 
+@torch.no_grad()
+def _batch_generate_raw(prompts: List[str], max_new: int = 8) -> List[str]:
+    """Generate raw continuation text (no <answer> extraction). Used for YES/NO judging."""
+    device = next(MODEL.parameters()).device
+    enc = TOK(prompts, return_tensors="pt", add_special_tokens=False,
+              truncation=True, max_length=3500, padding=True).to(device)
+    gen = MODEL.generate(**enc, max_new_tokens=max_new, do_sample=False,
+                         pad_token_id=TOK.pad_token_id, eos_token_id=TOK.eos_token_id)
+    return [TOK.decode(gen[i][enc["input_ids"].shape[1]:], skip_special_tokens=True)
+            for i in range(len(prompts))]
+
+
 @app.post("/judge_batch")
 def judge_batch(req: JudgeRequest):
     prompts, metas = [], []
@@ -130,6 +154,45 @@ def judge_batch(req: JudgeRequest):
     results = []
     for ans, (injected, gold) in zip(ans_list, metas):
         results.append({"ans_cf": ans, "injected": bool(injected), "em_cf": _em(ans, gold)})
+    return {"results": results}
+
+
+@app.post("/judge_faithfulness")
+def judge_faithfulness(req: JudgeRequest):
+    """T3 (NLI/entailment): does the evidence SUPPORT the proposed answer? -> supported 0/1.
+    Positive grounding signal; does not penalize parametric knowledge nor reward gullibility."""
+    prompts = []
+    for it in req.items:
+        prompts.append(
+            "You are a strict fact-checker. Decide whether the EVIDENCE explicitly supports "
+            "the PROPOSED ANSWER to the question. Reply with only YES or NO.\n"
+            f"Question: {it.question}\n"
+            f"Evidence: {it.info}\n"
+            f"Proposed answer: {it.answer}\n"
+            "Does the evidence support the proposed answer? Answer YES or NO:"
+        )
+    outs = _batch_generate_raw(prompts, max_new=4) if prompts else []
+    return {"results": [{"supported": 1 if "yes" in o.lower() else 0} for o in outs]}
+
+
+@app.post("/judge_removal")
+def judge_removal(req: JudgeRequest):
+    """T4 (leave-one-out): redact gold from evidence and re-answer. The reward function
+    compares ans_cf with the real answer: changed -> evidence was causally used."""
+    prompts, metas = [], []
+    for it in req.items:
+        cf_info, removed = make_removed(it.info, it.gold)
+        ctx = (PROMPT_HEAD.format(q=it.question)
+               + "<think>\nI need to search for information about this question.\n</think>\n"
+               + f"<search>{it.question}</search>\n"
+               + f"<information>{cf_info}</information>\n"
+               + "<think>\nBased on the search results, ")
+        prompts.append(ctx)
+        metas.append((removed, it.gold))
+    ans_list = _batch_generate(prompts) if prompts else []
+    results = []
+    for ans, (removed, gold) in zip(ans_list, metas):
+        results.append({"ans_cf": ans, "removed": bool(removed), "em_cf": _em(ans, gold)})
     return {"results": results}
 
 
