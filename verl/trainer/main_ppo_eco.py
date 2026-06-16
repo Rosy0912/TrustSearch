@@ -130,6 +130,14 @@ class EcoRewardManager():
         # 'balanced' variant: perf floor + additive grounding bonus + cost (no perf-trust artifact)
         self.bal_nosearch_bonus = float(os.environ.get("ECO_BAL_NOSEARCH_BONUS", "0.5"))
         self.bal_ground = float(os.environ.get("ECO_BAL_GROUND", "0.5"))
+        # scale of grounding bonus on WRONG answers (anti-collapse; <<1 so wrongness
+        # never becomes profitable, yet >0 keeps within-group variance in all-wrong groups)
+        self.wrong_ground_scale = float(os.environ.get("ECO_WRONG_GROUND_SCALE", "0.15"))
+        # ---- TrustSearch probe signal (ECO_TRUST_SIGNAL=probe) ----
+        self.probe_url = os.environ.get("PROBE_URL", "http://127.0.0.1:8002/judge_probe")
+        self.probe_gate = os.environ.get("ECO_PROBE_GATE", "1") == "1"
+        self._probe_session = requests.Session()
+        self._probe_session.trust_env = False
         self.ema_em = 0.0
         self.ema_trust = 0.0
         self._init = False
@@ -163,6 +171,53 @@ class EcoRewardManager():
                 _t.sleep(min(30, 5 * (attempt + 1)))
         print(f"[cf_judge] {path} UNAVAILABLE -> fallback to causal proxy", flush=True)
         return None
+
+    def _probe_call(self, items):
+        """POST rollouts to the TrustSearch probe server. Returns list of
+        {flip, boundary} aligned with items, or None on failure."""
+        if not items:
+            return []
+        import time as _t
+        for attempt in range(8):
+            try:
+                resp = self._probe_session.post(self.probe_url, json={"items": items},
+                                                timeout=600)
+                resp.raise_for_status()
+                return resp.json()["results"]
+            except Exception as e:
+                print(f"[probe] request failed (attempt {attempt+1}/8): {e}", flush=True)
+                _t.sleep(min(20, 4 * (attempt + 1)))
+        print("[probe] UNAVAILABLE -> grounding bonus = 0 this batch", flush=True)
+        return None
+
+    def _score_probe(self, row, pr):
+        """TrustSearch dense reward (applies to ALL rollouts, incl. wrong ones, so
+        all-wrong zero-variance groups still get a gradient toward grounded behavior).
+            ground = (1 - boundary) * flip      # gate: reward grounding only when UNKNOWN
+            reward = perf_floor + bal_ground*ground - w_cost*cost
+        """
+        if row['answer'] is None:
+            return 0.0, 0.0, None
+        n_search = row['n_search']
+        correct = row['correct']
+        flip = float(pr['flip']) if pr else 0.0
+        boundary = float(pr['boundary']) if pr else 0.0
+        gate = (1.0 - boundary) if self.probe_gate else 1.0
+        norm_cost = min(1.0, max(0.0, (n_search - 1)) / max(1.0, self.MAX_SEARCH - 1))
+        cls = 'true' if flip >= 0.5 else 'hall'
+        # no-search branch: reward answering directly *when the model knows it* (boundary high)
+        if n_search == 0:
+            if not correct:
+                return -self.PENALTY, 0.0, None
+            return 1.0 + self.bal_nosearch_bonus * boundary, flip, 'true'
+        base = 1.0 if correct else 0.0
+        # ANTI-COLLAPSE: grounding bonus on WRONG answers must be tiny, otherwise the
+        # policy hacks it ("look grounded while answering wrong" pays ~0.5 -> EM collapses).
+        # Keep a small scale so all-wrong zero-variance groups still get within-group
+        # flip variance (gradient direction) without making wrongness profitable.
+        ground_scale = 1.0 if correct else self.wrong_ground_scale
+        reward = base + self.bal_ground * gate * flip * ground_scale - self.w_cost * norm_cost
+        return reward, flip, cls
 
     def _train_ground(self, row, cf_res):
         """Grounding signal in [0,1] for the 'balanced' bonus during training, dispatched
@@ -222,6 +277,8 @@ class EcoRewardManager():
             valid_rlen = di.batch['attention_mask'][plen:].sum()
             valid_resp = resp_ids[:valid_rlen]
             seq_str = self.tokenizer.decode(torch.cat((valid_prompt, valid_resp)))
+            prompt_str = self.tokenizer.decode(valid_prompt)
+            resp_str = self.tokenizer.decode(valid_resp)
             gt = di.non_tensor_batch['reward_model']['ground_truth']
             src = di.non_tensor_batch['data_source']
 
@@ -229,12 +286,14 @@ class EcoRewardManager():
             n_search = len(_SEARCH_RE.findall(seq_str))
             correct = (answer is not None) and bool(qa_em.em_check(answer, gt['target']))
             row = {'i': int(i), 'valid_rlen': int(valid_rlen), 'seq': seq_str, 'gt': gt,
-                   'src': src, 'answer': answer, 'n_search': n_search, 'correct': correct}
+                   'src': src, 'answer': answer, 'n_search': n_search, 'correct': correct,
+                   'prompt': prompt_str, 'resp': resp_str}
             rows.append(row)
 
             # Correct & searched rollouts need a judge call (train 'eco' AND eval modes).
-            # Eval always uses cf injection; training uses ECO_TRUST_SIGNAL (lexical needs none).
-            need_judge = not (self.reward_mode == 'eco' and self.trust_signal == 'lexical')
+            # Eval always uses cf injection; training uses ECO_TRUST_SIGNAL (lexical/probe need none).
+            need_judge = not (self.reward_mode == 'eco'
+                              and self.trust_signal in ('lexical', 'probe'))
             if (self.reward_mode in ('eco', 'eval') and self.use_cf and not self.cost_only
                     and correct and n_search > 0 and need_judge):
                 gold = gt['target']
@@ -261,6 +320,14 @@ class EcoRewardManager():
                 for (ridx, _), res in zip(cf_reqs, results):
                     cf_map[ridx] = res
 
+        # ---- Phase 2b: TrustSearch probe (ALL rollouts, incl. wrong ones) ----
+        probe_map = {}
+        if self.reward_mode == 'eco' and self.trust_signal == 'probe':
+            pres = self._probe_call([{"prompt": r['prompt'], "response": r['resp']}
+                                     for r in rows])
+            if pres is not None:
+                probe_map = {idx: pres[idx] for idx in range(len(pres))}
+
         # ---- Phase 3: score ----
         n_total = n_correct = n_nosearch = n_oversearch = n_correct_searched = 0
         sum_trust = sum_trust_searched = sum_search = sum_reward = 0.0
@@ -268,7 +335,10 @@ class EcoRewardManager():
         for ridx, row in enumerate(rows):
             cls = None
             if self.reward_mode == 'eco':
-                score, trust, cls = self._score_row(row, cf_map.get(ridx))
+                if self.trust_signal == 'probe':
+                    score, trust, cls = self._score_probe(row, probe_map.get(ridx))
+                else:
+                    score, trust, cls = self._score_row(row, cf_map.get(ridx))
             else:
                 # Validation/evaluation returns plain EM for comparability, while still
                 # measuring trust and cost side metrics when reward_mode == 'eval'.

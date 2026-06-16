@@ -145,3 +145,7 @@ probe_*.py
 probe_*.sbatch
 eco_calibrate.py
 run_eco_calib.sbatch
+# large binary artifacts (data dumps & probe heads) - not source code
+dumps/
+probes/
+*.pkl

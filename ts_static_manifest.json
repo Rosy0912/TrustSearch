@@ -1,0 +1,6 @@
+{
+  "round": 0,
+  "encoder": "verl_checkpoints/sr1-baseline-em/actor/global_step_250",
+  "commit": "/home/jmzhang/self-evolution/Search-R1/probes/base250b/commit_probe.pkl",
+  "boundary": "/home/jmzhang/self-evolution/Search-R1/probes/base250b/boundary_probe.pkl"
+}
