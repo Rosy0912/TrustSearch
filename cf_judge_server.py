@@ -111,17 +111,24 @@ TOK = None
 RNG = random.Random(42)
 
 
+_CHUNK_SIZE = 16  # max prompts per GPU forward to avoid OOM
+
+
 @torch.no_grad()
 def _batch_generate(prompts: List[str], max_new: int = 64) -> List[str]:
     device = next(MODEL.parameters()).device
-    enc = TOK(prompts, return_tensors="pt", add_special_tokens=False,
-              truncation=True, max_length=3500, padding=True).to(device)
-    gen = MODEL.generate(**enc, max_new_tokens=max_new, do_sample=False,
-                         pad_token_id=TOK.pad_token_id, eos_token_id=TOK.eos_token_id)
     outs = []
-    for i in range(len(prompts)):
-        cont = TOK.decode(gen[i][enc["input_ids"].shape[1]:], skip_special_tokens=False)
-        outs.append(_extract_answer(cont))
+    for start in range(0, len(prompts), _CHUNK_SIZE):
+        chunk = prompts[start:start + _CHUNK_SIZE]
+        enc = TOK(chunk, return_tensors="pt", add_special_tokens=False,
+                  truncation=True, max_length=3500, padding=True).to(device)
+        gen = MODEL.generate(**enc, max_new_tokens=max_new, do_sample=False,
+                             pad_token_id=TOK.pad_token_id, eos_token_id=TOK.eos_token_id)
+        for i in range(len(chunk)):
+            cont = TOK.decode(gen[i][enc["input_ids"].shape[1]:], skip_special_tokens=False)
+            outs.append(_extract_answer(cont))
+        del enc, gen
+        torch.cuda.empty_cache()
     return outs
 
 
@@ -129,12 +136,18 @@ def _batch_generate(prompts: List[str], max_new: int = 64) -> List[str]:
 def _batch_generate_raw(prompts: List[str], max_new: int = 8) -> List[str]:
     """Generate raw continuation text (no <answer> extraction). Used for YES/NO judging."""
     device = next(MODEL.parameters()).device
-    enc = TOK(prompts, return_tensors="pt", add_special_tokens=False,
-              truncation=True, max_length=3500, padding=True).to(device)
-    gen = MODEL.generate(**enc, max_new_tokens=max_new, do_sample=False,
-                         pad_token_id=TOK.pad_token_id, eos_token_id=TOK.eos_token_id)
-    return [TOK.decode(gen[i][enc["input_ids"].shape[1]:], skip_special_tokens=True)
-            for i in range(len(prompts))]
+    outs = []
+    for start in range(0, len(prompts), _CHUNK_SIZE):
+        chunk = prompts[start:start + _CHUNK_SIZE]
+        enc = TOK(chunk, return_tensors="pt", add_special_tokens=False,
+                  truncation=True, max_length=3500, padding=True).to(device)
+        gen = MODEL.generate(**enc, max_new_tokens=max_new, do_sample=False,
+                             pad_token_id=TOK.pad_token_id, eos_token_id=TOK.eos_token_id)
+        outs.extend([TOK.decode(gen[i][enc["input_ids"].shape[1]:], skip_special_tokens=True)
+                     for i in range(len(chunk))])
+        del enc, gen
+        torch.cuda.empty_cache()
+    return outs
 
 
 @app.post("/judge_batch")

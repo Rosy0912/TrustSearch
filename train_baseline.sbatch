@@ -1,11 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=sr1_base
+#SBATCH --job-name=ts_baseline
 #SBATCH --partition=L40S
-#SBATCH --nodelist=node11
 #SBATCH --gres=gpu:6
 #SBATCH --cpus-per-task=48
-#SBATCH --mem=400G
-#SBATCH --time=4-00:00:00
+#SBATCH --mem=200G
+#SBATCH --time=7-00:00:00
 #SBATCH --output=logs/sr1_base_%j.out
 #SBATCH --error=logs/sr1_base_%j.err
 # Search-R1 BASELINE (plain EM reward). Same hyperparams as TrustSearch full so the

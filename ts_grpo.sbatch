@@ -3,7 +3,7 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=320G
-#SBATCH --time=18:00:00
+#SBATCH --time=7-00:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 # TrustSearch GRPO training, 4 ablation variants selected by $VARIANT:
@@ -18,22 +18,44 @@ source /home/jmzhang/miniconda3/etc/profile.d/conda.sh && conda activate searchr
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 export NO_PROXY="192.168.0.0/16,127.0.0.1,localhost"
 export PYTHONUNBUFFERED=1
+# Hard-export inside sbatch so the launched python (and its FSDP workers) actually
+# inherit it. Passing via --export only reached the shell, not the train process,
+# which is why earlier OOMs kept recommending expandable_segments. All observed OOMs
+# are fragmentation (tiny deficit < reclaimable fragment), not true capacity limits.
+# This is a pure allocator policy -> does NOT change gradients/numerics -> keeps the
+# ablation comparison clean.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# Use XFORMERS attention backend: FlashAttention triggers CUDA illegal memory
+# access on ADA6000/RTX4090 cards; XFORMERS is stable (matches baseline on L40S).
+export VLLM_ATTENTION_BACKEND=XFORMERS TRANSFORMERS_ATTN_IMPLEMENTATION=sdpa
 
 VARIANT="${VARIANT:?set VARIANT}"
-MODEL_PATH="${MODEL_PATH:-verl_checkpoints/sr1-baseline-em/actor/global_step_250}"
+MODEL_PATH="${MODEL_PATH:-/data1/public/hf/Qwen/Qwen2.5-3B-Instruct}"
 N_GPU="${N_GPU:-4}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.6}"
+# Offload toggles (default off for A100/40G+; set =true on 24GB cards like RTX3090).
+PARAM_OFFLOAD="${PARAM_OFFLOAD:-false}"
+GRAD_OFFLOAD="${GRAD_OFFLOAD:-false}"
+OPTIM_OFFLOAD="${OPTIM_OFFLOAD:-false}"
+PPO_MICRO_BS="${PPO_MICRO_BS:-8}"
 RETRIEVER_URL="${RETRIEVER_URL:-http://192.168.102.21:8000/retrieve}"
-export PROBE_URL="${PROBE_URL:-http://192.168.102.19:8002/judge_probe}"
+# probe server runs on node7 (192.168.102.17); port differs per variant
+# (full=8002, nogate=8003). Pass PROBE_URL explicitly at submit time.
+export PROBE_URL="${PROBE_URL:-http://192.168.102.15:8002/judge_probe}"
 export CF_JUDGE_URL="${CF_JUDGE_URL:-http://192.168.102.19:8001/judge_batch}"
-export EXPERIMENT_NAME="ts_${VARIANT}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-ts_${VARIANT}}"
+export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-128}"
+export N_AGENT="${N_AGENT:-5}"
+export SAVE_FREQ="${SAVE_FREQ:-25}"
+export TEST_FREQ="${TEST_FREQ:-25}"
+export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-400}"
 
 # ---- reward config per variant ----
 export ECO_TRUST_VARIANT=balanced
 export ECO_BAL_NOSEARCH_BONUS=0.5
 case "$VARIANT" in
   baseline) export ECO_TRUST_SIGNAL=lexical ECO_BAL_GROUND=0   ECO_W_COST=0   ECO_PROBE_GATE=1 ;;
-  full)     export ECO_TRUST_SIGNAL=probe   ECO_BAL_GROUND=0.5 ECO_W_COST=0.2 ECO_PROBE_GATE=1 ;;
+  full)     export ECO_TRUST_SIGNAL=probe   ECO_BAL_GROUND=${ECO_BAL_GROUND:-0.5} ECO_W_COST=${ECO_W_COST:-0.2} ECO_PROBE_GATE=1 ;;
   nogate)   export ECO_TRUST_SIGNAL=probe   ECO_BAL_GROUND=0.5 ECO_W_COST=0.2 ECO_PROBE_GATE=0 ;;
   nocost)   export ECO_TRUST_SIGNAL=probe   ECO_BAL_GROUND=0.5 ECO_W_COST=0   ECO_PROBE_GATE=1 ;;
   *) echo "unknown VARIANT=$VARIANT"; exit 1 ;;
@@ -69,16 +91,16 @@ python3 -m verl.trainer.main_ppo_eco \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.285 \
     actor_rollout_ref.actor.use_kl_loss=true \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
-    actor_rollout_ref.actor.ppo_micro_batch_size=8 \
-    actor_rollout_ref.actor.fsdp_config.param_offload=false \
-    actor_rollout_ref.actor.fsdp_config.grad_offload=false \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=false \
+    actor_rollout_ref.actor.ppo_micro_batch_size=${PPO_MICRO_BS} \
+    actor_rollout_ref.actor.fsdp_config.param_offload=${PARAM_OFFLOAD} \
+    actor_rollout_ref.actor.fsdp_config.grad_offload=${GRAD_OFFLOAD} \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${OPTIM_OFFLOAD} \
     actor_rollout_ref.rollout.log_prob_micro_batch_size=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEM_UTIL} \
     actor_rollout_ref.ref.log_prob_micro_batch_size=16 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=false \
+    actor_rollout_ref.ref.fsdp_config.param_offload=${PARAM_OFFLOAD} \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     algorithm.no_think_rl=false \
@@ -96,9 +118,9 @@ python3 -m verl.trainer.main_ppo_eco \
     trainer.project_name=TrustSearch \
     trainer.experiment_name=${EXPERIMENT_NAME} \
     trainer.total_epochs=15 \
-    trainer.total_training_steps=400 \
+    trainer.total_training_steps=${TOTAL_TRAINING_STEPS} \
     trainer.default_local_dir=verl_checkpoints/${EXPERIMENT_NAME} \
-    max_turns=2 \
+    max_turns=${MAX_TURNS:-4} \
     retriever.url="${RETRIEVER_URL}" \
     retriever.topk=3
 echo "[ts_grpo] $VARIANT done"

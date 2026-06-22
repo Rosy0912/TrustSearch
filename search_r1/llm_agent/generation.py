@@ -242,7 +242,12 @@ class LLMGenerationManager:
             # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
             rollings_active = DataProto.from_dict({
                 k: v[active_mask] for k, v in rollings.batch.items()
-            })            
+            })
+            # Propagate meta_info (e.g. do_sample=False for greedy validation) so the
+            # multi-turn rollout uses the SAME sampling regime as configured. Without
+            # this, generate_sequences falls back to do_sample=True (temperature=1),
+            # making validation non-deterministic.
+            rollings_active.meta_info = dict(rollings.meta_info)
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info            
@@ -285,7 +290,9 @@ class LLMGenerationManager:
             # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
             rollings_active = DataProto.from_dict({
                 k: v[active_mask] for k, v in rollings.batch.items()
-            })            
+            })
+            # Propagate meta_info (greedy validation flag) into the final-turn rollout too.
+            rollings_active.meta_info = dict(rollings.meta_info)
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info            

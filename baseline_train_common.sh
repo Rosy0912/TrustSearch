@@ -15,7 +15,7 @@ python3 -m verl.trainer.main_ppo \
     data.train_files=data/nq_search/train.parquet \
     data.val_files=data/nq_search/test.parquet \
     data.train_data_num=null \
-    data.val_data_num=100 \
+    data.val_data_num=200 \
     data.train_batch_size=120 \
     data.val_batch_size=64 \
     data.max_prompt_length=4096 \
@@ -30,7 +30,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.285 \
     actor_rollout_ref.actor.use_kl_loss=true \
-    actor_rollout_ref.actor.ppo_mini_batch_size=${MINI_BATCH} \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.ppo_micro_batch_size=8 \
     actor_rollout_ref.actor.fsdp_config.param_offload=false \
     actor_rollout_ref.actor.fsdp_config.grad_offload=false \
@@ -53,12 +53,12 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_hdfs_dir=null \
     trainer.n_gpus_per_node=${N_GPU} \
     trainer.nnodes=1 \
-    trainer.save_freq=50 \
+    trainer.save_freq=25 \
     trainer.test_freq=25 \
     trainer.project_name=Search-R1-HALO \
     trainer.experiment_name=${EXPERIMENT_NAME} \
     trainer.total_epochs=15 \
-    trainer.total_training_steps=500 \
+    trainer.total_training_steps=400 \
     trainer.default_local_dir=verl_checkpoints/${EXPERIMENT_NAME} \
     max_turns=2 \
     retriever.url="${RETRIEVER_URL}" \

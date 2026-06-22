@@ -133,9 +133,23 @@ class EcoRewardManager():
         # scale of grounding bonus on WRONG answers (anti-collapse; <<1 so wrongness
         # never becomes profitable, yet >0 keeps within-group variance in all-wrong groups)
         self.wrong_ground_scale = float(os.environ.get("ECO_WRONG_GROUND_SCALE", "0.15"))
+        # Reward floor for a TRIED-BUT-WRONG answer. MUST satisfy the ordering
+        #   -PENALTY (no answer / invalid)  <  wrong_floor  <  1 - w_cost (correct)
+        # so that "answer something" always beats "answer nothing" (kills the slacker
+        # pit) while "answer correctly" still dominates. Default 0.05 (PENALTY=0.1).
+        self.wrong_floor = float(os.environ.get("ECO_WRONG_FLOOR", "0.05"))
         # ---- TrustSearch probe signal (ECO_TRUST_SIGNAL=probe) ----
         self.probe_url = os.environ.get("PROBE_URL", "http://127.0.0.1:8002/judge_probe")
         self.probe_gate = os.environ.get("ECO_PROBE_GATE", "1") == "1"
+        # Probe is PART OF THE REWARD DEFINITION. It must never be silently skipped
+        # (that would train on EM/cost-only and silently corrupt the experiment).
+        # Strategy B (unattended-safe): block-and-retry the probe call essentially
+        # forever (capped backoff), so a transient probe-server outage/restart just
+        # PAUSES training instead of either crashing it or polluting it. Set
+        # ECO_PROBE_MAX_WAIT (seconds) to bound the wait; <=0 means wait indefinitely.
+        self.probe_max_wait = float(os.environ.get("ECO_PROBE_MAX_WAIT", "0"))  # 0 = forever
+        self.probe_timeout = float(os.environ.get("ECO_PROBE_TIMEOUT", "600"))
+        self.probe_backoff_cap = float(os.environ.get("ECO_PROBE_BACKOFF_CAP", "30"))
         self._probe_session = requests.Session()
         self._probe_session.trust_env = False
         self.ema_em = 0.0
@@ -149,7 +163,8 @@ class EcoRewardManager():
               f"floor={self.floor} alpha={self.alpha} bal_ground={self.bal_ground} "
               f"w_trust={self.w_trust} w_perf={self.w_perf} w_cost={self.w_cost} hall_penalty={self.hall_penalty} "
               f"use_cf={self.use_cf} cf_url={self.cf_url} no_self={self.no_self} "
-              f"cost_only={self.cost_only} trust_only={self.trust_only}")
+              f"cost_only={self.cost_only} trust_only={self.trust_only} "
+              f"probe_max_wait={self.probe_max_wait} probe_backoff_cap={self.probe_backoff_cap}")
 
     # ---- online counterfactual call ----
     def _judge_batch(self, items, path="/judge_batch"):
@@ -173,22 +188,36 @@ class EcoRewardManager():
         return None
 
     def _probe_call(self, items):
-        """POST rollouts to the TrustSearch probe server. Returns list of
-        {flip, boundary} aligned with items, or None on failure."""
+        """POST rollouts to the TrustSearch probe server. Blocks and retries until
+        the probe server responds (Strategy B), so a transient outage/restart PAUSES
+        training rather than corrupting it. Returns the results list. Only gives up
+        (RuntimeError) if ECO_PROBE_MAX_WAIT>0 is exceeded."""
         if not items:
             return []
         import time as _t
-        for attempt in range(8):
+        attempt = 0
+        waited = 0.0
+        while True:
+            attempt += 1
             try:
                 resp = self._probe_session.post(self.probe_url, json={"items": items},
-                                                timeout=600)
+                                                timeout=self.probe_timeout)
                 resp.raise_for_status()
+                if attempt > 1:
+                    print(f"[probe] recovered after {attempt-1} retries (~{waited:.0f}s waited); "
+                          f"resuming with valid trust reward", flush=True)
                 return resp.json()["results"]
             except Exception as e:
-                print(f"[probe] request failed (attempt {attempt+1}/8): {e}", flush=True)
-                _t.sleep(min(20, 4 * (attempt + 1)))
-        print("[probe] UNAVAILABLE -> grounding bonus = 0 this batch", flush=True)
-        return None
+                backoff = min(self.probe_backoff_cap, 4 * attempt)
+                print(f"[probe] UNAVAILABLE (attempt {attempt}, waited ~{waited:.0f}s): {e} "
+                      f"-> PAUSING this batch, retry in {backoff:.0f}s "
+                      f"(probe is required; NOT training on trust=0)", flush=True)
+                _t.sleep(backoff)
+                waited += backoff
+                if self.probe_max_wait > 0 and waited >= self.probe_max_wait:
+                    raise RuntimeError(
+                        f"[probe] still UNAVAILABLE after {waited:.0f}s (> ECO_PROBE_MAX_WAIT="
+                        f"{self.probe_max_wait}s). Aborting to avoid corrupting the run.")
 
     def _score_probe(self, row, pr):
         """TrustSearch dense reward (applies to ALL rollouts, incl. wrong ones, so
@@ -196,10 +225,28 @@ class EcoRewardManager():
             ground = (1 - boundary) * flip      # gate: reward grounding only when UNKNOWN
             reward = perf_floor + bal_ground*ground - w_cost*cost
         """
-        if row['answer'] is None:
-            return 0.0, 0.0, None
+        # ===================================================================
+        # REWARD LANDSCAPE ORDERING (lesson from BOTH collapses, 6/17):
+        #   correct  >  wrong-but-tried  >  no-answer/invalid (the "slacker pit")
+        #
+        # 1st collapse (over-search hack): grounding bonus decoupled from EM ->
+        #     model "performed grounded" while wrong, search/q -> 3.0, EM -> 0.
+        # 2nd collapse (slacker pit): after I clamped wrong rollouts to <=0, the
+        #     answer=None branch (=0) became BETTER than a wrong-and-searched
+        #     answer (<0). GRPO then drove the policy to STOP answering: it just
+        #     repeats "My previous action is invalid...", response_length 631->90,
+        #     entropy 0.85->0.20, EM -> 0.
+        #
+        # Fix: make NOT ANSWERING strictly the WORST outcome, and never let any
+        # shaping term push a tried-but-wrong answer below the no-answer floor.
+        # Cost is only charged on CORRECT answers (so cost never creates a pit that
+        # makes slacking look good). EM stays the dominant, un-hackable term.
+        # ===================================================================
         n_search = row['n_search']
         correct = row['correct']
+        # Slacker pit guard: no valid answer extracted == worst outcome.
+        if row['answer'] is None:
+            return -self.PENALTY, 0.0, None
         flip = float(pr['flip']) if pr else 0.0
         boundary = float(pr['boundary']) if pr else 0.0
         gate = (1.0 - boundary) if self.probe_gate else 1.0
@@ -208,15 +255,21 @@ class EcoRewardManager():
         # no-search branch: reward answering directly *when the model knows it* (boundary high)
         if n_search == 0:
             if not correct:
-                return -self.PENALTY, 0.0, None
+                # tried (gave an answer) but wrong & didn't search: small positive,
+                # strictly above the no-answer floor (-PENALTY) so "answer something"
+                # always beats "answer nothing".
+                return self.wrong_floor, 0.0, None
             return 1.0 + self.bal_nosearch_bonus * boundary, flip, 'true'
         base = 1.0 if correct else 0.0
-        # ANTI-COLLAPSE: grounding bonus on WRONG answers must be tiny, otherwise the
-        # policy hacks it ("look grounded while answering wrong" pays ~0.5 -> EM collapses).
-        # Keep a small scale so all-wrong zero-variance groups still get within-group
-        # flip variance (gradient direction) without making wrongness profitable.
-        ground_scale = 1.0 if correct else self.wrong_ground_scale
-        reward = base + self.bal_ground * gate * flip * ground_scale - self.w_cost * norm_cost
+        if correct:
+            # CORRECT: full grounding bonus, cost charged here (where we can afford it).
+            reward = base + self.bal_ground * gate * flip - self.w_cost * norm_cost
+        else:
+            # WRONG but tried & searched: a small POSITIVE floor plus a tiny grounding
+            # signal for within-group variance. NO cost penalty (cost must never push a
+            # tried answer below the no-answer floor and recreate the slacker pit).
+            # Strictly: wrong_floor < correct_min, and wrong_floor > -PENALTY (no-answer).
+            reward = self.wrong_floor + self.bal_ground * gate * flip * self.wrong_ground_scale
         return reward, flip, cls
 
     def _train_ground(self, row, cf_res):
@@ -290,12 +343,11 @@ class EcoRewardManager():
                    'prompt': prompt_str, 'resp': resp_str}
             rows.append(row)
 
-            # Correct & searched rollouts need a judge call (train 'eco' AND eval modes).
-            # Eval always uses cf injection; training uses ECO_TRUST_SIGNAL (lexical/probe need none).
-            need_judge = not (self.reward_mode == 'eco'
-                              and self.trust_signal in ('lexical', 'probe'))
+            # Correct & searched rollouts ALWAYS get a cf judge call for MONITORING
+            # (trust@correct & hall_rate must use the same yardstick across all methods).
+            # The reward itself still uses ECO_TRUST_SIGNAL (probe/lexical/cf/etc).
             if (self.reward_mode in ('eco', 'eval') and self.use_cf and not self.cost_only
-                    and correct and n_search > 0 and need_judge):
+                    and correct and n_search > 0):
                 gold = gt['target']
                 gold = list(gold) if isinstance(gold, (list, tuple, np.ndarray)) else [str(gold)]
                 cf_reqs.append((len(rows) - 1,
@@ -329,36 +381,38 @@ class EcoRewardManager():
                 probe_map = {idx: pres[idx] for idx in range(len(pres))}
 
         # ---- Phase 3: score ----
+        # MONITORING uses cf judge uniformly (same yardstick for all methods).
+        # REWARD uses method-specific logic (probe / lexical / cf / etc).
         n_total = n_correct = n_nosearch = n_oversearch = n_correct_searched = 0
-        sum_trust = sum_trust_searched = sum_search = sum_reward = 0.0
+        sum_trust = sum_trust_searched = sum_trust_correct = sum_search = sum_reward = 0.0
         cf_true = cf_hall = cf_amb = 0
         for ridx, row in enumerate(rows):
-            cls = None
+            # --- reward (method-specific, unchanged) ---
             if self.reward_mode == 'eco':
                 if self.trust_signal == 'probe':
-                    score, trust, cls = self._score_probe(row, probe_map.get(ridx))
+                    score, _reward_trust, _reward_cls = self._score_probe(row, probe_map.get(ridx))
                 else:
-                    score, trust, cls = self._score_row(row, cf_map.get(ridx))
+                    score, _reward_trust, _reward_cls = self._score_row(row, cf_map.get(ridx))
             else:
-                # Validation/evaluation returns plain EM for comparability, while still
-                # measuring trust and cost side metrics when reward_mode == 'eval'.
+                # Validation/evaluation returns plain EM for comparability.
                 score = qa_em.compute_score_em(row['seq'], row['gt'], format_score=self.format_score)
-                if self.reward_mode == 'eval':
-                    if row['correct'] and row['n_search'] == 0:
-                        trust = 1.0
-                    elif row['correct'] and row['n_search'] > 0:
-                        if self.cost_only:
-                            trust = 1.0
-                        elif self.use_cf:
-                            trust = self._cf_trust(row['answer'], cf_map.get(ridx), row['seq'])
-                            cls = ('true' if trust >= 0.99 else
-                                   ('hall' if abs(trust - self.floor) < 1e-6 else 'amb'))
-                        else:
-                            trust = _causal_trust(row['seq'], floor=self.floor)
-                    else:
-                        trust = 0.0
+
+            # --- monitoring trust (ALWAYS from cf judge, unified across methods) ---
+            cls = None
+            if row['correct'] and row['n_search'] == 0:
+                trust = 1.0  # answered correctly without searching → trivially grounded
+            elif row['correct'] and row['n_search'] > 0:
+                if self.cost_only:
+                    trust = 1.0
+                elif self.use_cf:
+                    trust = self._cf_trust(row['answer'], cf_map.get(ridx), row['seq'])
+                    cls = ('true' if trust >= 0.99 else
+                           ('hall' if abs(trust - self.floor) < 1e-6 else 'amb'))
                 else:
-                    trust = 0.0
+                    trust = _causal_trust(row['seq'], floor=self.floor)
+            else:
+                trust = 0.0
+
             if cls == 'true': cf_true += 1
             elif cls == 'hall': cf_hall += 1
             elif cls == 'amb': cf_amb += 1
@@ -370,6 +424,7 @@ class EcoRewardManager():
             sum_trust += trust
             if row['correct']:
                 n_correct += 1
+                sum_trust_correct += trust
                 if row['n_search'] > 0:
                     n_correct_searched += 1
                     sum_trust_searched += trust
@@ -386,8 +441,12 @@ class EcoRewardManager():
 
         if n_total > 0:
             em = n_correct / n_total
-            trust_at_correct = sum_trust / max(1, n_correct)
+            # FIX: trust@correct must average trust over CORRECT rollouts only.
+            # Previously divided sum_trust (over ALL rollouts) by n_correct, which
+            # blew up >1 (e.g. 4.9) when EM collapsed -- a misleading monitor signal.
+            trust_at_correct = sum_trust_correct / max(1, n_correct)
             trust_at_searched_correct = sum_trust_searched / max(1, n_correct_searched)
+            trust_all_mean = sum_trust / n_total
             search_mean = sum_search / n_total
             nosearch_rate = n_nosearch / n_total
             oversearch_rate = n_oversearch / n_total
@@ -421,6 +480,7 @@ class EcoRewardManager():
                 'perf/em': float(em),
                 'trust/trust_at_correct': float(trust_at_correct),
                 'trust/trust_at_searched_correct': float(trust_at_searched_correct),
+                'trust/trust_all_mean': float(trust_all_mean),
                 'trust/cf_true': float(cf_true),
                 'trust/cf_hall': float(cf_hall),
                 'trust/cf_amb': float(cf_amb),

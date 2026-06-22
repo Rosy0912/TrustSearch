@@ -126,11 +126,25 @@ verl_checkpoints/
 **/verl_checkpoints/
 *.safetensors
 *.npz
-*.png
+*.pkl
+*.joblib
 *_results.json
-aod_tool_direction_broad_results.json
+# generated images (except public/ which has README logos)
+/*.png
+bimodal_analysis.png
 
-# research / analysis scratch (not needed to run baseline or TrustSearch)
+# archive / backup directories
+_archive_*/
+.git_bak/
+
+# large binary / generated artifacts
+dumps/
+probes/
+figures/
+*.pdf
+*.parquet
+
+# research / analysis scratch (exploratory scripts not part of core system)
 analyze_*.py
 aod_tool_direction*.py
 behav_cf_*.py
@@ -141,11 +155,16 @@ maxact_*.py
 maxact_*.sbatch
 p2_*.py
 p2_*.sbatch
-probe_*.py
-probe_*.sbatch
+probe_revalidate.py
+probe_revalidate.sbatch
 eco_calibrate.py
 run_eco_calib.sbatch
-# large binary artifacts (data dumps & probe heads) - not source code
-dumps/
-probes/
-*.pkl
+
+# deprecated experiment scripts (superseded by ts_* and balanced reward)
+train_eco_*.sbatch
+run_eval-*.sbatch
+train_grpo_k1_3b_v2.sbatch
+
+# status / report scratch (not for public repo)
+STATUS_*.md
+REPORT_*.md

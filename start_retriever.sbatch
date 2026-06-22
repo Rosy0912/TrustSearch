@@ -5,7 +5,7 @@
 #SBATCH --nodelist=node11
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=80G
-#SBATCH --time=4-00:00:00
+#SBATCH --time=7-00:00:00
 #SBATCH --output=logs/retriever_%j.out
 #SBATCH --error=logs/retriever_%j.err
 # Long-running retriever service. Start BEFORE training jobs.

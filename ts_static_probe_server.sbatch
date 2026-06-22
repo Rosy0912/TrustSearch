@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=24:00:00
+#SBATCH --time=7-00:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 # Static probe server for ts_static ablation.
@@ -23,7 +23,7 @@ mkdir -p probes/live_ts_static
 
 # Initialize manifest with the starting encoder
 cat > probes/live_ts_static/manifest.json << 'EOF'
-{"round": 0, "encoder": "verl_checkpoints/sr1-baseline-em/actor/global_step_250",
+{"round": 0, "encoder": "/data1/public/hf/Qwen/Qwen2.5-3B-Instruct",
  "commit": "probes/base250b/commit_probe.pkl",
  "boundary": "probes/base250b/boundary_probe.pkl"}
 EOF

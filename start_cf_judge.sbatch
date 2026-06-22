@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=200G
-#SBATCH --time=4-00:00:00
+#SBATCH --time=7-00:00:00
 #SBATCH --output=logs/cf_judge_%j.out
 #SBATCH --error=logs/cf_judge_%j.err
 # Counterfactual judge service (node9, 192.168.102.19:8001) for EcoSearch online behavcf.
