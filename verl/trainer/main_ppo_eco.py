@@ -138,6 +138,13 @@ class EcoRewardManager():
         # so that "answer something" always beats "answer nothing" (kills the slacker
         # pit) while "answer correctly" still dominates. Default 0.05 (PENALTY=0.1).
         self.wrong_floor = float(os.environ.get("ECO_WRONG_FLOOR", "0.05"))
+        # ---- Probe-into-base (option B): make the CORRECT base itself depend on the
+        # commit probe (flip), so a truly-grounded correct answer scores higher than a
+        # memorized/lucky correct one. When ECO_PROBE_BASE>0, the correct base becomes
+        #   base = (1 - probe_base) + probe_base * flip      (in [1-pb, 1])
+        # i.e. a fully-grounded correct answer keeps base=1.0, a non-grounded (flip=0)
+        # correct answer is discounted to (1-probe_base). Default 0 = legacy fixed 1.0.
+        self.probe_base = float(os.environ.get("ECO_PROBE_BASE", "0.0"))
         # ---- TrustSearch probe signal (ECO_TRUST_SIGNAL=probe) ----
         self.probe_url = os.environ.get("PROBE_URL", "http://127.0.0.1:8002/judge_probe")
         self.probe_gate = os.environ.get("ECO_PROBE_GATE", "1") == "1"
@@ -260,7 +267,12 @@ class EcoRewardManager():
                 # always beats "answer nothing".
                 return self.wrong_floor, 0.0, None
             return 1.0 + self.bal_nosearch_bonus * boundary, flip, 'true'
-        base = 1.0 if correct else 0.0
+        # CORRECT base: legacy fixed 1.0, OR (option B) probe-modulated so a grounded
+        # correct answer outscores a memorized/lucky one within the same group.
+        if correct and self.probe_base > 0.0:
+            base = (1.0 - self.probe_base) + self.probe_base * flip
+        else:
+            base = 1.0 if correct else 0.0
         if correct:
             # CORRECT: full grounding bonus, cost charged here (where we can afford it).
             reward = base + self.bal_ground * gate * flip - self.w_cost * norm_cost

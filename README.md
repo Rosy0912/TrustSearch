@@ -1,12 +1,39 @@
-# Search-R1 + TrustSearch
+# Search-R1 + TrustSearch / IRIS
 
 This repository contains **Search-R1** (an RL framework for training reasoning-and-searching
 interleaved LLMs, built on [veRL](https://github.com/volcengine/verl)) together with
-**TrustSearch**, our extension that rewards *trustworthy and cost-efficient* tool use.
+**TrustSearch / IRIS** (**I**ntrinsic **R**epresentation-level **I**ncentive for **S**earch),
+our extension that rewards *trustworthy and cost-efficient* tool use via an **intrinsic,
+representation-level grounding signal** read from the policy's own hidden states.
 
-- Original Search-R1 usage and theory: see [`README.md`](README.md).
-- This file (`README_TRUSTSEARCH.md`) is the **hand-off guide** for reproducing the
-  baseline vs. TrustSearch comparison on your own cluster.
+- Original Search-R1 usage and theory: see [`README_SearchR1.md`](README_SearchR1.md).
+- This file is the **hand-off guide** for reproducing the baseline vs. IRIS comparison.
+
+---
+
+## ⭐ Latest Results (co-evolution, step 50)
+
+Three-dimensional evaluation (Performance × Trust × Cost) on the NQ validation set.
+IRIS uses the **EM-first, stronger-probe, relaxed-cost** recipe (`F14_emfirst`:
+`bal_ground=0.6, w_cost=0.02, wrong_ground_scale=0.0`) with the probe **co-evolving**
+(refit from the current policy every 25 steps).
+
+| Metric | **IRIS (step 50)** | TrustSearch (prior) | Baseline | Verdict |
+|--------|:---:|:---:|:---:|:---:|
+| **EM** | **0.453** | 0.367 ~ 0.453 | 0.342 ~ 0.389 | ✅ at the upper bound |
+| **trust@correct** | **0.976** | 0.930 ~ 0.975 | 0.922 ~ 0.930 | ✅ at the upper bound |
+| **hall_rate** | **0.034** | 0.03 ~ 0.07 | 0.06 ~ 0.08 | ✅ lowest |
+| **search/q** | **2.094** | 2.03 ~ 2.09 | 2.12 ~ 2.17 | ✅ fewer searches |
+
+IRIS matches the best historical EM (0.453) while achieving the lowest hallucination
+rate (0.034) and the most efficient search — better than the baseline on all three axes.
+
+**Diagnostic (why representation-level?)** — among EM-correct rollouts, separating
+*grounded-correct* from *parametric-correct* trajectories: hidden-state read-outs
+(AUC 0.75–0.78, linear; **0.89–0.92** with the MLP probe used in training) substantially
+beat scalar intrinsic signals (entropy 0.65 / answer-logprob 0.57 / max-logprob 0.65)
+and logit-level read-outs (0.64). The grounding signal lives in the representation,
+not in scalar confidence.
 
 ---
 
@@ -129,23 +156,35 @@ sbatch start_cf_judge.sbatch        # serves http://<node>:8001/judge_batch
 
 ### Step 3 — launch training
 
-```bash
-# Search-R1 baseline (plain EM reward)
-sbatch train_baseline.sbatch
+**(a) IRIS co-evolution (recommended)** — one script launches the full three-piece
+pipeline (hot-reloadable probe server + GRPO training + co-evolution controller that
+refits both probes from the current policy every 25 steps):
 
-# TrustSearch (online counterfactual trust + cost)
-sbatch train_eco_full.sbatch
+```bash
+bash submit_ts_coevo_emfirst.sh     # recipe F14_emfirst, probe co-evolves /25 steps
 ```
 
-Both use identical hyper-parameters (GRPO, Qwen2.5-3B-Instruct, n_agent=5,
-max_turns=2); the **only difference is the reward**, so the comparison is clean.
+**(b) Frozen-probe recipe sweep** — fixed reward coefficients, probe NOT updated
+(isolates the reward recipe). Pick a recipe via `RECIPE=`:
+
+```bash
+RECIPE=F14_emfirst PROBE_URL=http://<probe>:8008/judge_probe sbatch ts_recipe.sbatch
+```
+
+Key reward knobs (recipe `F14_emfirst`, the EM-first / strong-probe / relaxed-cost setting):
+`ECO_BAL_GROUND=0.6` (probe grounding weight), `ECO_W_COST=0.02` (relaxed search cost),
+`ECO_WRONG_GROUND_SCALE=0.0` (EM stays dominant). All share GRPO, Qwen2.5-3B-Instruct,
+`n_agent=5`, `max_turns=4`; the **only difference vs. baseline is the reward**.
+
+> **Note on the 3B GRPO training:** it needs **≥4×48GB GPUs** (ADA6000/L40S) without
+> offload, or **8×24GB** (RTX4090) with full offload. 4×24GB or 2×40GB **OOM** in the
+> backward pass.
 
 ### Step 4 — offline 3-dimension evaluation of a checkpoint
 
 ```bash
-# edit MODEL_PATH inside, then:
-sbatch eval_ckpt50.sbatch           # eval a trained checkpoint
-sbatch eval_base.sbatch             # eval the untrained base model
+# edit BASELINE_CKPT / TRUST_CKPT inside, then:
+sbatch ts_eval_full.sbatch          # full 3610-sample 3-dim eval (EM × trust × cost)
 ```
 
 ---

@@ -114,21 +114,38 @@ RNG = random.Random(42)
 _CHUNK_SIZE = 16  # max prompts per GPU forward to avoid OOM
 
 
+def _sanitize_enc(enc, device):
+    """Guard against out-of-range token ids (the #1 cause of CUDA device-side
+    asserts that permanently corrupt the process). Clamp ids into [0, vocab)."""
+    vocab = int(getattr(MODEL.config, "vocab_size", TOK.vocab_size))
+    if "input_ids" in enc:
+        enc["input_ids"] = enc["input_ids"].clamp_(0, vocab - 1)
+    return enc.to(device)
+
+
 @torch.no_grad()
 def _batch_generate(prompts: List[str], max_new: int = 64) -> List[str]:
     device = next(MODEL.parameters()).device
     outs = []
     for start in range(0, len(prompts), _CHUNK_SIZE):
         chunk = prompts[start:start + _CHUNK_SIZE]
-        enc = TOK(chunk, return_tensors="pt", add_special_tokens=False,
-                  truncation=True, max_length=3500, padding=True).to(device)
-        gen = MODEL.generate(**enc, max_new_tokens=max_new, do_sample=False,
-                             pad_token_id=TOK.pad_token_id, eos_token_id=TOK.eos_token_id)
-        for i in range(len(chunk)):
-            cont = TOK.decode(gen[i][enc["input_ids"].shape[1]:], skip_special_tokens=False)
-            outs.append(_extract_answer(cont))
-        del enc, gen
-        torch.cuda.empty_cache()
+        try:
+            enc = TOK(chunk, return_tensors="pt", add_special_tokens=False,
+                      truncation=True, max_length=3500, padding=True)
+            enc = _sanitize_enc(enc, device)
+            gen = MODEL.generate(**enc, max_new_tokens=max_new, do_sample=False,
+                                 pad_token_id=TOK.pad_token_id, eos_token_id=TOK.eos_token_id)
+            for i in range(len(chunk)):
+                cont = TOK.decode(gen[i][enc["input_ids"].shape[1]:], skip_special_tokens=False)
+                outs.append(_extract_answer(cont))
+            del enc, gen
+            torch.cuda.empty_cache()
+        except Exception as e:
+            # Never let one bad chunk poison the whole service. Return empty
+            # answers for this chunk (-> em_cf=0 / AMB downgrade on the caller).
+            print(f"[cf_judge] _batch_generate chunk failed, returning empty: {e}", flush=True)
+            torch.cuda.empty_cache()
+            outs.extend([""] * len(chunk))
     return outs
 
 
@@ -139,14 +156,20 @@ def _batch_generate_raw(prompts: List[str], max_new: int = 8) -> List[str]:
     outs = []
     for start in range(0, len(prompts), _CHUNK_SIZE):
         chunk = prompts[start:start + _CHUNK_SIZE]
-        enc = TOK(chunk, return_tensors="pt", add_special_tokens=False,
-                  truncation=True, max_length=3500, padding=True).to(device)
-        gen = MODEL.generate(**enc, max_new_tokens=max_new, do_sample=False,
-                             pad_token_id=TOK.pad_token_id, eos_token_id=TOK.eos_token_id)
-        outs.extend([TOK.decode(gen[i][enc["input_ids"].shape[1]:], skip_special_tokens=True)
-                     for i in range(len(chunk))])
-        del enc, gen
-        torch.cuda.empty_cache()
+        try:
+            enc = TOK(chunk, return_tensors="pt", add_special_tokens=False,
+                      truncation=True, max_length=3500, padding=True)
+            enc = _sanitize_enc(enc, device)
+            gen = MODEL.generate(**enc, max_new_tokens=max_new, do_sample=False,
+                                 pad_token_id=TOK.pad_token_id, eos_token_id=TOK.eos_token_id)
+            outs.extend([TOK.decode(gen[i][enc["input_ids"].shape[1]:], skip_special_tokens=True)
+                         for i in range(len(chunk))])
+            del enc, gen
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"[cf_judge] _batch_generate_raw chunk failed, returning empty: {e}", flush=True)
+            torch.cuda.empty_cache()
+            outs.extend([""] * len(chunk))
     return outs
 
 

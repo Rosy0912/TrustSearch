@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=ts_eval_full
+#SBATCH --partition=ADA6000
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
@@ -25,13 +26,15 @@ export VLLM_ATTENTION_BACKEND=XFORMERS TRANSFORMERS_ATTN_IMPLEMENTATION=sdpa
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 RETRIEVER_URL="${RETRIEVER_URL:-http://192.168.102.21:8000/retrieve}"
-export CF_JUDGE_URL="${CF_JUDGE_URL:-http://192.168.102.19:8001/judge_batch}"
+export CF_JUDGE_URL="${CF_JUDGE_URL:-http://192.168.102.11:8001/judge_batch}"
 # Eval mode: unified cf-injection for trust measurement
 export ECO_TRUST_VARIANT=balanced ECO_TRUST_SIGNAL=cf ECO_USE_CF=1
 
 N_GPU="${N_GPU:-1}"
-# A100 80GB can afford higher GPU mem util for faster vLLM inference
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.6}"
+# ckpt is fp32 (~12.8GB weights, 3B). FSDP gathers params + vLLM keeps a bf16 copy +
+# weight-sync needs a transient copy. On ADA6000 (48GB) util=0.4 leaves ample room;
+# on A100-40GB this combo OOMs, so we run eval on the 48GB ADA6000 partition.
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.4}"
 
 # --- Wait for retriever ---
 echo "[ts_eval_full] Waiting for retriever at ${RETRIEVER_URL}..."

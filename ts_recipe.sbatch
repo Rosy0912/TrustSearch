@@ -40,6 +40,9 @@ RECIPE="${RECIPE:?set RECIPE (F1_emfirst|F2_balanced|F3_strongcost|F4_lowground|
 MODEL_PATH="${MODEL_PATH:-/data1/public/hf/Qwen/Qwen2.5-3B-Instruct}"
 N_GPU="${N_GPU:-4}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.6}"
+# Micro-batch sizes (override smaller on 24GB cards like RTX4090 to avoid OOM).
+PPO_MICRO_BS="${PPO_MICRO_BS:-8}"
+LOGPROB_MICRO_BS="${LOGPROB_MICRO_BS:-16}"
 # Offload toggles (default off for A100/40G+; set =true on 24GB cards like RTX4090).
 PARAM_OFFLOAD="${PARAM_OFFLOAD:-false}"
 GRAD_OFFLOAD="${GRAD_OFFLOAD:-false}"
@@ -48,7 +51,7 @@ RETRIEVER_URL="${RETRIEVER_URL:-http://192.168.102.21:8000/retrieve}"
 # Shared FROZEN probe server (round0). All recipes connect to the same one so the
 # probe is identical across recipes -> only the reward coefficients differ.
 export PROBE_URL="${PROBE_URL:-http://192.168.102.15:8005/judge_probe}"
-export CF_JUDGE_URL="${CF_JUDGE_URL:-http://192.168.102.19:8001/judge_batch}"
+export CF_JUDGE_URL="${CF_JUDGE_URL:-http://192.168.102.11:8001/judge_batch}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-rcp_${RECIPE}}"
 export SAVE_FREQ="${SAVE_FREQ:-25}"
 export TEST_FREQ="${TEST_FREQ:-25}"
@@ -71,6 +74,12 @@ case "$RECIPE" in
   F7_costheavy)   export ECO_BAL_GROUND=0.2  ECO_W_COST=0.5  ECO_WRONG_GROUND_SCALE=0.0  ;;  # extreme cost, minimal ground
   F8_minground)   export ECO_BAL_GROUND=0.1  ECO_W_COST=0.2  ECO_WRONG_GROUND_SCALE=0.0  ;;  # EM almost solo, tiny ground
   F9_midhigh)     export ECO_BAL_GROUND=0.4  ECO_W_COST=0.25 ECO_WRONG_GROUND_SCALE=0.0  ;;  # between F2 and F5
+  F10_lowcost)    export ECO_BAL_GROUND=0.3  ECO_W_COST=0.05 ECO_WRONG_GROUND_SCALE=0.0  ;;  # low cost: same ground as F2, cost nearly off
+  F11_resume50)   export ECO_BAL_GROUND=0.3  ECO_W_COST=0.05 ECO_WRONG_GROUND_SCALE=0.0  ;;  # resume F2 step50 w/ gentle cost (F2 collapsed via under-search @ cost0.2)
+  # New priority (6/23): EM-first (base=1.0 + wrong_scale=0.0) + STRONGER probe (ground up)
+  # + RELAXED cost. For CO-EVOLUTION (probe refit every 25 steps).
+  F14_emfirst)    export ECO_BAL_GROUND=0.6  ECO_W_COST=0.02 ECO_WRONG_GROUND_SCALE=0.0  ;;  # probe x2, cost relaxed, EM dominant
+  F14_emfirst_hi) export ECO_BAL_GROUND=0.8  ECO_W_COST=0.02 ECO_WRONG_GROUND_SCALE=0.0  ;;  # probe x2.7, cost relaxed, EM dominant
   *) echo "unknown RECIPE=$RECIPE"; exit 1 ;;
 esac
 echo "[ts_recipe] $(hostname) recipe=$RECIPE bal_ground=$ECO_BAL_GROUND w_cost=$ECO_W_COST "\
@@ -111,15 +120,15 @@ python3 -m verl.trainer.main_ppo_eco \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.285 \
     actor_rollout_ref.actor.use_kl_loss=true \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
-    actor_rollout_ref.actor.ppo_micro_batch_size=8 \
+    actor_rollout_ref.actor.ppo_micro_batch_size=${PPO_MICRO_BS} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${PARAM_OFFLOAD} \
     actor_rollout_ref.actor.fsdp_config.grad_offload=${GRAD_OFFLOAD} \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${OPTIM_OFFLOAD} \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size=16 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size=${LOGPROB_MICRO_BS} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEM_UTIL} \
-    actor_rollout_ref.ref.log_prob_micro_batch_size=16 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size=${LOGPROB_MICRO_BS} \
     actor_rollout_ref.ref.fsdp_config.param_offload=${PARAM_OFFLOAD} \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
